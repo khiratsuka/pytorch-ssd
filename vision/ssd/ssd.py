@@ -3,10 +3,11 @@ import torch
 import numpy as np
 from typing import List, Tuple
 import torch.nn.functional as F
+from torch.quantization import QuantStub, DeQuantStub
 
 from ..utils import box_utils
 from collections import namedtuple
-GraphPath = namedtuple("GraphPath", ['s0', 'name', 's1'])  #
+GraphPath = namedtuple("GraphPath", ['s0', 'name', 's1'])
 
 
 class SSD(nn.Module):
@@ -25,6 +26,8 @@ class SSD(nn.Module):
         self.regression_headers = regression_headers
         self.is_test = is_test
         self.config = config
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
 
         # register layers in source_layer_indexes by adding them to a module list
         self.source_layer_add_ons = nn.ModuleList([t[1] for t in source_layer_indexes
@@ -42,6 +45,7 @@ class SSD(nn.Module):
         locations = []
         start_layer_index = 0
         header_index = 0
+        x = self.quant(x)
         for end_layer_index in self.source_layer_indexes:
             if isinstance(end_layer_index, GraphPath):
                 path = end_layer_index
@@ -86,7 +90,9 @@ class SSD(nn.Module):
 
         confidences = torch.cat(confidences, 1)
         locations = torch.cat(locations, 1)
-        
+        x = self.dequant(x)
+        confidences = self.dequant(confidences)
+        locations = self.dequant(locations)
         if self.is_test:
             confidences = F.softmax(confidences, dim=2)
             boxes = box_utils.convert_locations_to_boxes(

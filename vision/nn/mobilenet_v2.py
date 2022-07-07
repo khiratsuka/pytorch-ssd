@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 import math
 
@@ -5,49 +6,26 @@ import math
 # In this version, Relu6 is replaced with Relu to make it ONNX compatible.
 # BatchNorm Layer is optional to make it easy do batch norm confusion.
 
-
-def conv_bn(inp, oup, stride, use_batch_norm=True, onnx_compatible=False):
-    ReLU = nn.ReLU if onnx_compatible else nn.ReLU6
-
-    if use_batch_norm:
-        return nn.Sequential(
-            nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+#(inp, oup, kernel, stride, padding)
+class ConvBNReLU(nn.Sequential):
+    def __init__(self, inp, oup, kernel_size=3, stride=1, padding=1, groups=1):
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(inp, oup, kernel_size, stride, padding, groups=groups, bias=False),
             nn.BatchNorm2d(oup),
-            ReLU(inplace=True)
+            nn.ReLU(inplace=True)
         )
-    else:
-        return nn.Sequential(
-            nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
-            ReLU(inplace=True)
-        )
-
-
-def conv_1x1_bn(inp, oup, use_batch_norm=True, onnx_compatible=False):
-    ReLU = nn.ReLU if onnx_compatible else nn.ReLU6
-    if use_batch_norm:
-        return nn.Sequential(
-            nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
-            nn.BatchNorm2d(oup),
-            ReLU(inplace=True)
-        )
-    else:
-        return nn.Sequential(
-            nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
-            ReLU(inplace=True)
-        )
-
 
 class InvertedResidual(nn.Module):
     def __init__(self, inp, oup, stride, expand_ratio, use_batch_norm=True, onnx_compatible=False):
         super(InvertedResidual, self).__init__()
-        ReLU = nn.ReLU if onnx_compatible else nn.ReLU6
+        ReLU = nn.ReLU
 
         self.stride = stride
         assert stride in [1, 2]
 
         hidden_dim = round(inp * expand_ratio)
         self.use_res_connect = self.stride == 1 and inp == oup
-
+        layers = []
         if expand_ratio == 1:
             if use_batch_norm:
                 self.conv = nn.Sequential(
@@ -59,14 +37,7 @@ class InvertedResidual(nn.Module):
                     nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                     nn.BatchNorm2d(oup),
                 )
-            else:
-                self.conv = nn.Sequential(
-                    # dw
-                    nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
-                    ReLU(inplace=True),
-                    # pw-linear
-                    nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                )
+
         else:
             if use_batch_norm:
                 self.conv = nn.Sequential(
@@ -82,23 +53,26 @@ class InvertedResidual(nn.Module):
                     nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
                     nn.BatchNorm2d(oup),
                 )
-            else:
-                self.conv = nn.Sequential(
-                    # pw
-                    nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
-                    ReLU(inplace=True),
-                    # dw
-                    nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
-                    ReLU(inplace=True),
-                    # pw-linear
-                    nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                )
+        self.skip_add = nn.quantized.FloatFunctional()
 
     def forward(self, x):
         if self.use_res_connect:
-            return x + self.conv(x)
+            return self.skip_add.add(x, self.conv(x))
         else:
             return self.conv(x)
+
+    def fuse_model(self):
+        for m in self.modules():
+            if type(m) == InvertedResidual:
+                # expand_ratio == 1の場合
+                if len(m.conv) == 5:
+                    torch.quantization.fuse_modules(m.conv, ['0', '1', '2'], inplace=True)
+                    torch.quantization.fuse_modules(m.conv, ['3', '4'], inplace=True)
+                # expand_ratio != 1の場合
+                if len(m.conv) == 8:
+                    torch.quantization.fuse_modules(m.conv, ['0', '1', '2'], inplace=True)
+                    torch.quantization.fuse_modules(m.conv, ['3', '4', '5'], inplace=True)
+                    torch.quantization.fuse_modules(m.conv, ['6', '7'], inplace=True)
 
 
 class MobileNetV2(nn.Module):
@@ -123,23 +97,18 @@ class MobileNetV2(nn.Module):
         assert input_size % 32 == 0
         input_channel = int(input_channel * width_mult)
         self.last_channel = int(last_channel * width_mult) if width_mult > 1.0 else last_channel
-        self.features = [conv_bn(3, input_channel, 2, onnx_compatible=onnx_compatible)]
+        self.features = [ConvBNReLU(3, input_channel, 3, 2, 1)]
         # building inverted residual blocks
         for t, c, n, s in interverted_residual_setting:
             output_channel = int(c * width_mult)
             for i in range(n):
                 if i == 0:
-                    self.features.append(block(input_channel, output_channel, s,
-                                               expand_ratio=t, use_batch_norm=use_batch_norm,
-                                               onnx_compatible=onnx_compatible))
+                    self.features.append(block(input_channel, output_channel, s, expand_ratio=t))
                 else:
-                    self.features.append(block(input_channel, output_channel, 1,
-                                               expand_ratio=t, use_batch_norm=use_batch_norm,
-                                               onnx_compatible=onnx_compatible))
+                    self.features.append(block(input_channel, output_channel, 1, expand_ratio=t))
                 input_channel = output_channel
         # building last several layers
-        self.features.append(conv_1x1_bn(input_channel, self.last_channel,
-                                         use_batch_norm=use_batch_norm, onnx_compatible=onnx_compatible))
+        self.features.append(ConvBNReLU(input_channel, self.last_channel, 1, 1, 0))
         # make it nn.Sequential
         self.features = nn.Sequential(*self.features)
 
@@ -148,7 +117,6 @@ class MobileNetV2(nn.Module):
             nn.Dropout(dropout_ratio),
             nn.Linear(self.last_channel, n_class),
         )
-
         self._initialize_weights()
 
     def forward(self, x):
@@ -171,3 +139,4 @@ class MobileNetV2(nn.Module):
                 n = m.weight.size(1)
                 m.weight.data.normal_(0, 0.01)
                 m.bias.data.zero_()
+    

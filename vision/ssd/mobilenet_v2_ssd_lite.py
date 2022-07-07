@@ -1,29 +1,25 @@
 import torch
 from torch.nn import Conv2d, Sequential, ModuleList, BatchNorm2d
 from torch import nn
-from ..nn.mobilenet_v2 import MobileNetV2, InvertedResidual
+from ..nn.mobilenet_v2 import MobileNetV2, InvertedResidual, ConvBNReLU
 
 from .ssd import SSD, GraphPath
 from .predictor import Predictor
 from .config import mobilenetv1_ssd_config as config
 
-
-def SeperableConv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, onnx_compatible=False):
-    """Replace Conv2d with a depthwise Conv2d and Pointwise Conv2d.
-    """
-    ReLU = nn.ReLU if onnx_compatible else nn.ReLU6
-    return Sequential(
-        Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size,
-               groups=in_channels, stride=stride, padding=padding),
-        BatchNorm2d(in_channels),
-        ReLU(),
-        Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1),
-    )
+class SeparableConv2d(nn.Sequential):
+    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=0):
+        super(SeparableConv2d, self).__init__(
+            Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size,
+                   groups=in_channels, stride=stride, padding=padding),
+            BatchNorm2d(in_channels),
+            nn.ReLU(),
+            Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
+        )
 
 
-def create_mobilenetv2_ssd_lite(num_classes, width_mult=1.0, use_batch_norm=True, onnx_compatible=False, is_test=False):
-    base_net = MobileNetV2(width_mult=width_mult, use_batch_norm=use_batch_norm,
-                           onnx_compatible=onnx_compatible).features
+def create_mobilenetv2_ssd_lite(num_classes, width_mult=1.0, use_batch_norm=True, is_test=False):
+    base_net = MobileNetV2().features
 
     source_layer_indexes = [
         GraphPath(14, 'conv', 3),
@@ -37,27 +33,34 @@ def create_mobilenetv2_ssd_lite(num_classes, width_mult=1.0, use_batch_norm=True
     ])
 
     regression_headers = ModuleList([
-        SeperableConv2d(in_channels=round(576 * width_mult), out_channels=6 * 4,
-                        kernel_size=3, padding=1, onnx_compatible=False),
-        SeperableConv2d(in_channels=1280, out_channels=6 * 4, kernel_size=3, padding=1, onnx_compatible=False),
-        SeperableConv2d(in_channels=512, out_channels=6 * 4, kernel_size=3, padding=1, onnx_compatible=False),
-        SeperableConv2d(in_channels=256, out_channels=6 * 4, kernel_size=3, padding=1, onnx_compatible=False),
-        SeperableConv2d(in_channels=256, out_channels=6 * 4, kernel_size=3, padding=1, onnx_compatible=False),
+        SeparableConv2d(in_channels=round(576 * width_mult), out_channels=6 * 4,
+                        kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=1280, out_channels=6 * 4, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=512, out_channels=6 * 4, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=256, out_channels=6 * 4, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=256, out_channels=6 * 4, kernel_size=3, padding=1),
         Conv2d(in_channels=64, out_channels=6 * 4, kernel_size=1),
     ])
 
     classification_headers = ModuleList([
-        SeperableConv2d(in_channels=round(576 * width_mult), out_channels=6 * num_classes, kernel_size=3, padding=1),
-        SeperableConv2d(in_channels=1280, out_channels=6 * num_classes, kernel_size=3, padding=1),
-        SeperableConv2d(in_channels=512, out_channels=6 * num_classes, kernel_size=3, padding=1),
-        SeperableConv2d(in_channels=256, out_channels=6 * num_classes, kernel_size=3, padding=1),
-        SeperableConv2d(in_channels=256, out_channels=6 * num_classes, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=round(576 * width_mult), out_channels=6 * num_classes, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=1280, out_channels=6 * num_classes, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=512, out_channels=6 * num_classes, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=256, out_channels=6 * num_classes, kernel_size=3, padding=1),
+        SeparableConv2d(in_channels=256, out_channels=6 * num_classes, kernel_size=3, padding=1),
         Conv2d(in_channels=64, out_channels=6 * num_classes, kernel_size=1),
     ])
 
     return SSD(num_classes, base_net, source_layer_indexes,
                extras, classification_headers, regression_headers, is_test=is_test, config=config)
 
+def fuse_model_mobilenetv2_ssd_lite(net):
+    for m in net.modules():
+        if type(m) == ConvBNReLU or type(m) == SeparableConv2d:
+            torch.quantization.fuse_modules(m, ['0', '1', '2'], inplace=True)
+        if type(m) == InvertedResidual:
+            m.fuse_model()
+    return net
 
 def create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200, nms_method=None, sigma=0.5, device=torch.device('cpu')):
     predictor = Predictor(net, config.image_size, config.image_mean,
